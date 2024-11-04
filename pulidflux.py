@@ -62,6 +62,45 @@ class PulidFluxModel(nn.Module):
     def get_embeds(self, face_embed, clip_embeds):
         return self.pulid_encoder(face_embed, clip_embeds)
 
+def apply_pulid_attention(self, img, timesteps, ca_idx, node_data):
+    """
+    Apply PuLID attention with mask processing and sequence conversion
+
+    Args:
+        img: Input image tensor
+        timesteps: Timestep tensor
+        ca_idx: Current attention index
+        node_data: Dictionary containing node data
+        real_image_shape: Shape of the real image for mask resizing (optional)
+    
+    Returns:
+        Modified image tensor and updated ca_idx
+    """
+    if torch.any((node_data['sigma_start'] >= timesteps) & (timesteps >= node_data['sigma_end'])):
+        # Get attention result
+        attn_result = self.pulid_ca[ca_idx](node_data['embedding'], img)
+       
+        # Process mask if it exists in node_data
+        if 'attn_mask' in node_data:
+            mask = node_data['attn_mask']
+            print(f"attn_result shape: {attn_result.shape}, mask shape: {mask.shape}, img shape: {img.shape}")           
+                
+            # Convert mask to sequence using 16x16 patches
+            patch_size = 16
+            batch_size, height, width = mask.shape
+            mask = mask.view(batch_size, height // patch_size, patch_size, width // patch_size, patch_size)
+            mask_seq = mask.mean(dim=(2, 4))  # Average over each 16x16 patch to get sequence values
+            
+            # Expand mask sequence to match attn_result's shape for masking operation
+            mask_seq = mask_seq.view(batch_size, -1, 1)  # Shape: (batch_size, seq_len, 1)
+            attn_result = attn_result * mask_seq  # Element-wise multiplication with attention result
+            
+        # Update the image tensor with weighted attention result
+        img = img + node_data['weight'] * attn_result
+    
+    return img
+
+
 def forward_orig(
     self,
     img: Tensor,
@@ -102,13 +141,10 @@ def forward_orig(
                     img += add
 
         # PuLID attention
-        if self.pulid_data:
-            if i % self.pulid_double_interval == 0:
-                # Will calculate influence of all pulid nodes at once
-                for _, node_data in self.pulid_data.items():
-                    if torch.any((node_data['sigma_start'] >= timesteps) & (timesteps >= node_data['sigma_end'])):
-                        img = img + node_data['weight'] * self.pulid_ca[ca_idx](node_data['embedding'], img)
-                ca_idx += 1
+        if self.pulid_data and i % self.pulid_double_interval == 0:
+            for _, node_data in self.pulid_data.items():
+                img = apply_pulid_attention(self, img, timesteps, ca_idx, node_data)
+            ca_idx += 1
 
     img = torch.cat((txt, img), 1)
 
@@ -120,20 +156,23 @@ def forward_orig(
             if i < len(control_o):
                 add = control_o[i]
                 if add is not None:
-                    img[:, txt.shape[1] :, ...] += add
+                    img[:, txt.shape[1]:, ...] += add
 
         # PuLID attention
-        if self.pulid_data:
+        if self.pulid_data and i % self.pulid_single_interval == 0:
             real_img, txt = img[:, txt.shape[1]:, ...], img[:, :txt.shape[1], ...]
-            if i % self.pulid_single_interval == 0:
-                # Will calculate influence of all nodes at once
-                for _, node_data in self.pulid_data.items():
-                    if torch.any((node_data['sigma_start'] >= timesteps) & (timesteps >= node_data['sigma_end'])):
-                        real_img = real_img + node_data['weight'] * self.pulid_ca[ca_idx](node_data['embedding'], real_img)
-                ca_idx += 1
+            for _, node_data in self.pulid_data.items():
+                real_img = apply_pulid_attention(
+                    self,
+                    real_img, 
+                    timesteps, 
+                    ca_idx, 
+                    node_data,                    
+                )
+            ca_idx += 1
             img = torch.cat((txt, real_img), 1)
 
-    img = img[:, txt.shape[1] :, ...]
+    img = img[:, txt.shape[1]:, ...]
 
     img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
     return img
@@ -198,6 +237,9 @@ class PulidFluxInsightFaceLoader:
 
         return (model,)
 
+
+
+MAX_RESOLUTION=16384
 class PulidFluxEvaClipLoader:
     @classmethod
     def INPUT_TYPES(s):
@@ -241,6 +283,8 @@ class ApplyPulidFlux:
             },
             "optional": {
                 "attn_mask": ("MASK", ),
+                "mask_target_width": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 8, "forceInput": True}),
+                "mask_target_height": ("INT", {"default": 0, "min": 0, "max": MAX_RESOLUTION, "step": 8,"forceInput": True}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID"
@@ -254,7 +298,7 @@ class ApplyPulidFlux:
     def __init__(self):
         self.pulid_data_dict = None
 
-    def apply_pulid_flux(self, model, pulid_flux, eva_clip, face_analysis, image, weight, start_at, end_at, attn_mask=None, unique_id=None):
+    def apply_pulid_flux(self, model, pulid_flux, eva_clip, face_analysis, image, weight, start_at, end_at, attn_mask=None, unique_id=None, mask_target_width=0, mask_target_height=0):
         device = comfy.model_management.get_torch_device()
         # Why should I care what args say, when the unet model has a different dtype?!
         # Am I missing something?!
@@ -275,6 +319,8 @@ class ApplyPulidFlux:
                 attn_mask = attn_mask.squeeze(-1)
             elif attn_mask.dim() < 3:
                 attn_mask = attn_mask.unsqueeze(0)
+            if mask_target_width != 0 and mask_target_height != 0:
+                attn_mask = torch.nn.functional.interpolate(attn_mask.unsqueeze(0), size=(mask_target_height, mask_target_width), mode='nearest').squeeze(0)
             attn_mask = attn_mask.to(device, dtype=dtype)
 
         image = tensor_to_image(image)
@@ -390,6 +436,7 @@ class ApplyPulidFlux:
             'embedding': cond,
             'sigma_start': sigma_start,
             'sigma_end': sigma_end,
+            "attn_mask": attn_mask
         }
 
         # Keep a reference for destructor (if node is deleted the data will be deleted as well)
