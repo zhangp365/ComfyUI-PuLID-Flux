@@ -81,8 +81,8 @@ def apply_pulid_attention(self, img, timesteps, ca_idx, node_data):
         attn_result = self.pulid_ca[ca_idx](node_data['embedding'], img)
        
         # Process mask if it exists in node_data
-        if 'attn_mask' in node_data:
-            mask = node_data['attn_mask']
+        mask = node_data.get('attn_mask')
+        if mask is not None:            
             print(f"attn_result shape: {attn_result.shape}, mask shape: {mask.shape}, img shape: {img.shape}")           
                 
             # Convert mask to sequence using 16x16 patches
